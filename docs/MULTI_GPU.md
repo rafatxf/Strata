@@ -153,7 +153,7 @@ restart. Defaults are off unless the table says otherwise.
 | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
 | `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192). | |
 | `STRATA_SPLIT_OVERLAP=1` | Overlapped hand-off between stages on different cards. | Helps AMD; no gain on NVIDIA. See [below](#overlapped-hand-off). |
-| `STRATA_DP_PREFILL=1` | Long prompts are read by both cards at once: each card runs every layer on alternating chunks. Needs exactly two cards in a layer split, `STRATA_KV_HOST_DMA=1`, no `--batch`, `--peer-device` or stage trim, and every expert in RAM. | Opt-in. On 2x RTX 3090 prompts of 12K-123K tokens read 16-67 % faster, shorter ones up to 4 % slower (a smaller expert cache). See [below](#data-parallel-prompt-path). |
+| `STRATA_DP_PREFILL=1` | Long prompts are read by both cards at once: each card runs every layer on alternating chunks. Needs exactly two cards in a layer split, `STRATA_KV_HOST_DMA=1`, no `--batch`, `--peer-device` or stage trim, and every expert in RAM or peer access between the cards. | Opt-in. On 2x RTX 3090 prompts of 12K-123K tokens read 16-67 % faster, shorter ones up to 4 % slower (a smaller expert cache). See [below](#data-parallel-prompt-path). |
 | `--split-device D1[,D2..]` | The later stages' devices (default: the next visible ones). `--layer-split K --split-device 0` runs both stages on one card; a bit-exact hand-off check, not a speed mode. | |
 
 **The resident RAM mode works on a split.** `--resident-experts` (the low-RAM mode) leaves out of the RAM copy the experts any
@@ -186,9 +186,12 @@ first card to the second. With `STRATA_DP_PREFILL=1` both cards run every layer,
   layer, which the card that ran chunk k copies to the other card (peer copies where the platform allows them).
 - The last chunk runs on the drafter's card and has at least 4224 tokens. A segment the plan cannot split that way, and a
   continuation that starts inside a K/V block, are read by the layer pipeline as before.
-- Each card streams the experts of the other card's layers that it does not cache, so every expert must be in RAM. With
-  `--mmap-experts`, `--resident-experts` or a file-backed arena (`STRATA_ARENA_MMAP=1`) the engine says so and reads every
-  prompt through the layer pipeline.
+- Each card needs the experts of the other card's layers. Those the other card caches are read from its slots in place over
+  the peer link (`STRATA_DP_PEER_RES`, on by default, where the two cards map each other's memory), and the rest come from
+  RAM as in the layer pipeline, so DP also runs with `--mmap-experts`, `--resident-experts` or `--resident-budget-gib`.
+  With `STRATA_DP_PEER_RES=0` they are streamed instead, so every expert must be in RAM: with those options or a
+  file-backed arena (`STRATA_ARENA_MMAP=1`) the engine says so and reads every prompt through the layer pipeline, as it
+  does when they are set and the cards have no peer access.
 
 The engine logs `DP prompt path on` at startup and `DP prompt path linked` when the server starts. When it cannot run, it says
 why and the layer pipeline reads every prompt.
@@ -219,6 +222,19 @@ own timing, medians of three alternating rounds:
 | 43,036 | 3,422 | 4,453 (+30 %) |
 | 88,907 | 4,005 | 4,793 (+20 %) |
 | 122,507 | 4,082 | 4,724 (+16 %) |
+
+On a low-RAM box: 2x RTX 2080 Ti 22 GB (NVLink, PCIe 3.0 x8 each), i7-6700, 56 GB RAM, Unsloth Flash-Next UD-IQ4_XS,
+384K context, int8 K/V, `--layer-split 24 --resident-budget-gib 29` (29 GiB of the 55 GiB of experts in RAM, the rest in the
+two caches), `STRATA_KV_HOST_DMA=1`; one fresh engine per arm, prompt seconds from the engine's own timing, nothing reused:
+
+| Prompt | Layer pipeline | `STRATA_DP_PREFILL=1` (peer slots) |
+| --- | --- | --- |
+| 16,384 (15,872 read) | 16.4 s | 14.0 s (-15 %) |
+| 65,536 | 41.0 s | 37.6 s (-8 %) |
+
+Without the peer slots the same box read 82 GB from the model file for a 16K prompt, 22 s against the pipeline's 16 s (now
+refused at startup). On x8 links the gain shrinks with length: each card streams the experts no card holds for all 48
+layers, on half the chunks, so each link carries about what it carries in the layer pipeline.
 
 The drafter gap, on a ~48K-token prompt of C++ source and an answer that copies 30 of its lines (greedy, six requests each):
 lines from the drafter card's last chunk decoded at 197 tok/s with 98.0 % of drafts accepted on the layer pipeline and

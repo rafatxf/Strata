@@ -312,6 +312,9 @@ public:
     static bool run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
                        int64_t min_last, std::string& err);
     static std::shared_ptr<DpLink> make_dp_link(int n_layers, int dev_a, int dev_b, std::string& err);
+    /// true when each card of the link maps the other's memory (peer access on both ways): a kernel on one card can then
+    /// read the other's expert slots (STRATA_DP_PEER_RES) and weights in place
+    static bool dp_link_mapped(const std::shared_ptr<DpLink>& link);
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.

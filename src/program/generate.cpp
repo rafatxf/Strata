@@ -6471,6 +6471,7 @@ int main(int argc, char** argv) {
     // PLE run (the stage's copy of the weights, its own buffers).
     strata::core::SessionState dp_ss[2];
     bool dp_on = false;
+    bool dp_needs_map = false;   // DP reads the other card's memory in place: on only where the link maps it both ways
     {
         const char* ev = std::getenv("STRATA_DP_PREFILL");
         const char* kd = std::getenv("STRATA_KV_HOST_DMA");
@@ -6481,11 +6482,15 @@ int main(int argc, char** argv) {
         if (asked && !ok)
             std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off (two GPUs in a layer split, no --batch / "
                                  "--peer-device / stage trim, streamed K/V and STRATA_KV_HOST_DMA=1)\n");
-        // A DP read streams every expert of the other GPU's layers that this GPU does not cache, those the other GPU
-        // caches included.  The expert arena holds every expert in RAM; --mmap-experts / --resident-experts keep in RAM
-        // only what no GPU caches, and a file-backed arena (STRATA_ARENA_MMAP=1) hands the GPU-held ones back, so there
-        // those would be read from the model file on every DP prompt (#4875: a 16K prompt read 82 GB from storage and
-        // was slower than the layer pipeline).  There the layer pipeline reads every prompt.
+        // A DP read needs every expert of the other GPU's layers.  The ones the other GPU caches are read from its slots
+        // in place over the peer link (STRATA_DP_PEER_RES, default on, where the two cards map each other's memory:
+        // Prefill::run_dp's residency view); the rest come from RAM as in the layer pipeline.  Otherwise they are
+        // streamed, and --mmap-experts / --resident-experts keep in RAM only what no GPU caches (a file-backed arena,
+        // STRATA_ARENA_MMAP=1, hands the GPU-held ones back), so there they would be read from the model file on every
+        // DP prompt (#4875: a 16K prompt read 82 GB from storage and was slower than the layer pipeline).  Without the
+        // mapping (checked when the server links the two paths) the layer pipeline reads every prompt there.
+        const char* peer_res_env = std::getenv("STRATA_DP_PEER_RES");
+        const bool peer_res = peer_res_env == nullptr || peer_res_env[0] != '0';
         const char* arena_mmap = std::getenv("STRATA_ARENA_MMAP");
         const char* arena_release = std::getenv("STRATA_ARENA_RELEASE");
         const bool held_in_ram = !o.mmap_experts && !(arena_mmap != nullptr && arena_mmap[0] == '1' &&
@@ -6498,9 +6503,10 @@ int main(int argc, char** argv) {
                                  "kept per card; a DP read runs every layer on one card)\n");
             ok = false;
         }
-        if (ok && !held_in_ram) {
-            std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off: a DP read streams the experts the other GPU "
-                                 "caches, and with --mmap-experts / --resident-experts (or a file-backed arena that hands "
+        if (ok && !held_in_ram && peer_res) dp_needs_map = true;
+        if (ok && !held_in_ram && !peer_res) {
+            std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off: with STRATA_DP_PEER_RES=0 a DP read streams the "
+                                 "experts the other GPU caches, and with --mmap-experts / --resident-experts (or a file-backed arena that hands "
                                  "them back) they are not in RAM - the model file would be read on every long prompt\n");
             ok = false;
         }
@@ -10890,6 +10896,11 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill::make_dp_link((int) g.n_layers, 0, stages[0]->dev, err);
             if (!link) {
                 std::fprintf(stderr, "strata serve: DP prompt path: %s - off\n", err.c_str());
+                dp_on = false;
+            } else if (dp_needs_map && !strata::prefill::Prefill::dp_link_mapped(link)) {
+                std::fprintf(stderr, "strata serve: DP prompt path off: the two cards do not map each other's memory, and "
+                                     "here (the experts not all in RAM) a DP read would take the other card's cached "
+                                     "experts from its slots in place\n");
                 dp_on = false;
             } else {
                 sp.set_dp(&stages[0]->sp, &dp_ss[0], 0, split_at[0], link, 0);

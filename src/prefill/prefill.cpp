@@ -3170,6 +3170,9 @@ struct KvaTap {
 };
 }  // namespace
 
+// DP: a residency entry with this bit is a slot of the OTHER GPU's cache (read over the peer link), not of this one's
+constexpr int32_t kDpPeerRes = 0x40000000;
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
@@ -3186,6 +3189,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool dp = dp_active_;
     auto owns_gdn = [](const core::SessionState& S, int64_t gi) { return gi >= S.gdn_ord0 && gi < S.gdn_ord0 + S.gdn_alloc; };
     auto owns_qsa = [](const core::SessionState& S, int64_t qi) { return qi >= S.qsa_ord0 && qi < S.qsa_ord0 + S.qsa_alloc; };
+    // DP: a slot pointer of this path's residency entry (the peer's cache for kDpPeerRes entries) and the slot of THIS
+    // GPU's cache it names (-1 for the peer's: not in this GPU's slots)
+    auto res_ptr = [&m, this](int32_t s) -> const uint8_t* {
+        return (s & kDpPeerRes) ? dp_peer_->impl_->cache->device_slot(s & ~kDpPeerRes) : m.cache->device_slot(s);
+    };
+    auto res_cslot = [](int32_t s) -> int32_t { return (s & kDpPeerRes) ? -1 : s; };
     core::PleRun& PR = (dp && dp_foreign_ != nullptr && !ss.ple.ready() && dp_foreign_->ple.ready()) ? dp_foreign_->ple : ss.ple;
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
@@ -4646,7 +4655,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
                                 } else {                  // not streamed: resident (the walk streams all others)
-                                    blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                    blob[e - b.e0] = res_ptr(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed
                                     // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
                                     ++stats_.experts_resident;
@@ -5111,7 +5120,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // fused layout (its Hq holds stream_all_min() - 1 tokens' rows).
                             static const bool ws_dbg = std::getenv("STRATA_DBG_NAN") != nullptr;
                             const double ws_u = n > 0 ? (double) rows_local / (double) n : 0.0;
-                            if (ws::mode() != 0 && m.xoff_dev != nullptr && m.ws_chunks != nullptr && n > 0 && !ws_dbg &&
+                            if (!dp && ws::mode() != 0 && m.xoff_dev != nullptr && m.ws_chunks != nullptr && n > 0 && !ws_dbg &&
                                 lay.native && m.cache != nullptr && m.host_res != nullptr && !wmma_l &&
                                 !mmq_plan().direct[(size_t) l] && lay.fmt[(size_t) l].up_off == mmq_gub / 2 &&
                                 order_peer.empty() && rows_cpu == 0 && rows_local == T * K && !m.fused_bufs && m.group_cap == 0 &&
@@ -5860,8 +5869,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int32_t e = order[j];
                                 if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
-                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
-                                                 m.host_res[(size_t) l * m.g->n_expert + e])) return false;
+                                    if (!compute(j, res_ptr(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
+                                                 res_cslot(m.host_res[(size_t) l * m.g->n_expert + e]))) return false;
                                 } else {
                                     if (!group_resident) {   // grouped: the flush waits once, on the group's last copy
                                         pt.mark(kPfWaitCopy, cs);
@@ -5902,7 +5911,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                                    const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                    const uint8_t* bp = r0 ? res_ptr(m.host_res[(size_t) l * m.g->n_expert + e])
                                                            : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;
@@ -7803,6 +7812,7 @@ struct Prefill::DpLink {
     std::vector<int64_t> pub[2];        // per layer: the last chunk whose layer state path i has published (-1: none)
     std::vector<cudaEvent_t> ev[2];     // per layer, recorded on path i's stream (its device)
     int dev[2] = {0, 0};
+    bool mapped = false;   // peer access on both ways (dp_link_mapped)
     bool abort = false;
     ~DpLink() {
         for (int i = 0; i < 2; ++i) {
@@ -7816,6 +7826,7 @@ std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, 
     auto L = std::make_shared<DpLink>();
     L->dev[0] = dev_a;
     L->dev[1] = dev_b;
+    bool on_both = true;
     for (int i = 0; i < 2; ++i) {
         const core::OnDevice on(L->dev[i]);
         L->pub[i].assign((size_t) n_layers, -1);
@@ -7830,6 +7841,7 @@ std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, 
         if (cudaDeviceCanAccessPeer(&can, L->dev[i], L->dev[1 - i]) == cudaSuccess && can) {
             const cudaError_t e = cudaDeviceEnablePeerAccess(L->dev[1 - i], 0);
             if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                can = 0;
                 (void) cudaGetLastError();
                 std::fprintf(stderr, "prefill DP: peer access CUDA%d -> CUDA%d failed: %s\n", L->dev[i], L->dev[1 - i],
                              cudaGetErrorString(e));
@@ -7837,9 +7849,13 @@ std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, 
             (void) cudaGetLastError();
         }
         std::fprintf(stderr, "prefill DP: CUDA%d -> CUDA%d peer access %s\n", L->dev[i], L->dev[1 - i], can ? "on" : "off");
+        on_both = on_both && can != 0;
     }
+    L->mapped = on_both;
     return L;
 }
+
+bool Prefill::dp_link_mapped(const std::shared_ptr<DpLink>& link) { return link != nullptr && link->mapped; }
 
 void Prefill::set_dp(Prefill* peer, core::SessionState* foreign, int64_t own_lb, int64_t own_le,
                      std::shared_ptr<DpLink> link, int index) {
@@ -7966,9 +7982,17 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         const int64_t E = xm.g->n_expert, NL = xm.g->n_layers;
         sv[i] = {X.stage_lb_, X.stage_le_, X.next_, xm.host_res, X.on_stage_chunk, X.stop_at_chunk};
         X.dp_res_.assign((size_t) (NL * E), -1);
+        static const bool peer_res_env = [] { const char* v = std::getenv("STRATA_DP_PEER_RES"); return v == nullptr || v[0] != '0'; }();
+        const bool peer_res = peer_res_env && a.dp_link_ != nullptr && a.dp_link_->mapped;
         if (xm.host_res != nullptr)
-            for (int64_t l = X.dp_own_lb_; l < X.dp_own_le_; ++l)
-                std::copy(xm.host_res + l * E, xm.host_res + (l + 1) * E, X.dp_res_.begin() + l * E);
+            for (int64_t l = 0; l < NL; ++l) {
+                const bool own = l >= X.dp_own_lb_ && l < X.dp_own_le_;
+                for (int64_t e = 0; e < E; ++e) {
+                    const int32_t v = xm.host_res[l * E + e];
+                    // a foreign layer's expert the other GPU holds: its slot there, read over the peer link
+                    X.dp_res_[(size_t) (l * E + e)] = own ? v : (peer_res && v >= 0 ? (v | kDpPeerRes) : -1);
+                }
+            }
         xm.host_res = X.dp_res_.data();
         X.stage_lb_ = 0;
         X.stage_le_ = NL;
