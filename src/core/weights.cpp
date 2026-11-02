@@ -512,7 +512,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
 
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);
-    return it == table_.end() ? nullptr : &it->second;
+    const WeightRef* r = it == table_.end() ? nullptr : &it->second;
+    if (dp_fallback_ != nullptr && (r == nullptr || (r->data == nullptr && r->native_data == nullptr && r->hc_q8 == nullptr))) {
+        const WeightRef* o = dp_fallback_->find(name);
+        if (o != nullptr && (o->data != nullptr || o->native_data != nullptr || o->hc_q8 != nullptr)) return o;
+    }
+    return r;
 }
 
 void WeightTable::hc_q8_names(int64_t n_layers, std::set<std::string>& out) {

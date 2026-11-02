@@ -153,7 +153,7 @@ restart. Defaults are off unless the table says otherwise.
 | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
 | `STRATA_SPLIT_CHUNK16K=1` | Keeps the 16384-token auto chunk on AMD gfx12 splits (default 8192). | |
 | `STRATA_SPLIT_OVERLAP=1` | Overlapped hand-off between stages on different cards. | Helps AMD; no gain on NVIDIA. See [below](#overlapped-hand-off). |
-| `STRATA_DP_PREFILL=1` | Long prompts are read by both cards at once: each card runs every layer on alternating chunks. Needs exactly two cards in a layer split, `STRATA_KV_HOST_DMA=1`, no `--batch`, `--peer-device` or stage trim, and every expert in RAM or peer access between the cards. | Opt-in. On 2x RTX 3090 prompts of 12K-123K tokens read 16-67 % faster, shorter ones up to 4 % slower (a smaller expert cache). See [below](#data-parallel-prompt-path). |
+| `STRATA_DP_PREFILL=1` | Long prompts are read by both cards at once: each card runs every layer on alternating chunks. Needs exactly two cards in a layer split, `STRATA_KV_HOST_DMA=1`, no `--batch` or `--peer-device`, and every expert in RAM or peer access between the cards (also needed with stage trim). | Opt-in. On 2x RTX 3090 prompts of 12K-123K tokens read 16-67 % faster, shorter ones up to 4 % slower (a smaller expert cache). See [below](#data-parallel-prompt-path). |
 | `--split-device D1[,D2..]` | The later stages' devices (default: the next visible ones). `--layer-split K --split-device 0` runs both stages on one card; a bit-exact hand-off check, not a speed mode. | |
 
 **The resident RAM mode works on a split.** `--resident-experts` (the low-RAM mode) leaves out of the RAM copy the experts any
@@ -193,6 +193,10 @@ first card to the second. With `STRATA_DP_PREFILL=1` both cards run every layer,
   file-backed arena (`STRATA_ARENA_MMAP=1`) the engine says so and reads every prompt through the layer pipeline, as it
   does when they are set and the cards have no peer access.
 
+- With stage trim (`STRATA_STAGE_TRIM=1` and an explicit `--layer-split K`) each card holds only its own layers' dense
+  weights, so a DP read takes the other card's rows of its foreign layers from that card in place. That needs peer access
+  between the cards; without it the layer pipeline reads every prompt.
+
 The engine logs `DP prompt path on` at startup and `DP prompt path linked` when the server starts. When it cannot run, it says
 why and the layer pipeline reads every prompt.
 
@@ -231,6 +235,9 @@ two caches), `STRATA_KV_HOST_DMA=1`; one fresh engine per arm, prompt seconds fr
 | --- | --- | --- |
 | 16,384 (15,872 read) | 16.4 s | 14.0 s (-15 %) |
 | 65,536 | 41.0 s | 37.6 s (-8 %) |
+
+With stage trim on the same box (`STRATA_STAGE_TRIM=1`, which here gives the expert caches 7,504 / 6,983 slots against
+6,562 / 6,019): 16,384 tokens 15.6 -> 13.6 s (-12 %), 65,536 tokens 36.7 -> 34.0 s (-7 %).
 
 Without the peer slots the same box read 82 GB from the model file for a 16K prompt, 22 s against the pipeline's 16 s (now
 refused at startup). On x8 links the gain shrinks with length: each card streams the experts no card holds for all 48

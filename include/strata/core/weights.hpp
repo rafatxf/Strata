@@ -139,6 +139,9 @@ public:
     bool read_bf16_host(const std::string& name, std::vector<uint16_t>& out, std::string& err) const;
 
     const WeightRef* find(const std::string& name) const;
+    /// DP prefill (STRATA_DP_PREFILL): while the other GPU's table is set, a row this table skipped (a stage-trimmed layer:
+    /// no data, no native or Q8 copy) is that table's row - device pointers the peer link reads.  nullptr clears it.
+    void set_dp_fallback(const WeightTable* other) const { dp_fallback_ = other; }
     /// STRATA_HC_Q8: the hyper-connection projections (`blk.*.hc_{attn,ffn}_{down,up}.weight`) the loader SKIPPED
     /// are read from the pack, quantized to int8 + one fp32 scale per 32 values, and uploaded to their own device
     /// allocation (`q8_scale` set).  Returns the bytes uploaded in `bytes`.
@@ -151,6 +154,7 @@ public:
 private:
     friend class NativeDense;
     std::map<std::string, WeightRef> table_;
+    mutable const WeightTable* dp_fallback_ = nullptr;
     LoadReport report_;
     std::string pack_dir_;
 };

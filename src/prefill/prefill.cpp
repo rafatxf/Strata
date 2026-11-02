@@ -8005,6 +8005,8 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         X.force_planned_ = false;
         X.dp_plan_ = plan;
         X.dp_active_ = true;
+        if (xm.wt != nullptr && P[1 - i]->impl_->wt != nullptr && xm.wt != P[1 - i]->impl_->wt)
+            xm.wt->set_dp_fallback(P[1 - i]->impl_->wt);   // a trimmed stage: the other card's rows of its foreign layers
     }
     {
         std::lock_guard<std::mutex> lk(a.dp_link_->mu);
@@ -8049,6 +8051,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
                 P[j]->impl_->host_res = sv[j].res; P[j]->stage_lb_ = sv[j].lb; P[j]->stage_le_ = sv[j].le;
                 P[j]->next_ = sv[j].next; P[j]->on_stage_chunk = std::move(sv[j].osc); P[j]->stop_at_chunk = std::move(sv[j].sac);
                 P[j]->force_chunk_ = 0; P[j]->dp_active_ = false;
+                if (P[j]->impl_->wt != nullptr) P[j]->impl_->wt->set_dp_fallback(nullptr);
             }
             return false;
         }
@@ -8084,6 +8087,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         X.on_stage_chunk = std::move(sv[i].osc);
         X.stop_at_chunk = std::move(sv[i].sac);
         X.dp_active_ = false;
+        if (X.impl_->wt != nullptr) X.impl_->wt->set_dp_fallback(nullptr);
     }
     int32_t last[2] = {prev0[0], prev0[1]};
     for (int64_t t = 0; t < n; ++t) { last[0] = last[1]; last[1] = (int32_t) tokens[t]; }

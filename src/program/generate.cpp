@@ -6476,12 +6476,12 @@ int main(int argc, char** argv) {
         const char* ev = std::getenv("STRATA_DP_PREFILL");
         const char* kd = std::getenv("STRATA_KV_HOST_DMA");
         const bool asked = ev != nullptr && ev[0] == '1';
-        bool ok = asked && multi_gpu && stages.size() == 1 && o.batch == 0 && o.peer_device < 0 && !stage_trim &&
+        bool ok = asked && multi_gpu && stages.size() == 1 && o.batch == 0 && o.peer_device < 0 &&
                   kd != nullptr && kd[0] == '1' && g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1 &&
                   stages[0]->ss.qsa_states[stages[0]->ss.qsa_primary()].kv_mode == 1;
         if (asked && !ok)
             std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off (two GPUs in a layer split, no --batch / "
-                                 "--peer-device / stage trim, streamed K/V and STRATA_KV_HOST_DMA=1)\n");
+                                 "--peer-device, streamed K/V and STRATA_KV_HOST_DMA=1)\n");
         // A DP read needs every expert of the other GPU's layers.  The ones the other GPU caches are read from its slots
         // in place over the peer link (STRATA_DP_PEER_RES, default on, where the two cards map each other's memory:
         // Prefill::run_dp's residency view); the rest come from RAM as in the layer pipeline.  Otherwise they are
@@ -6504,6 +6504,9 @@ int main(int argc, char** argv) {
             ok = false;
         }
         if (ok && !held_in_ram && peer_res) dp_needs_map = true;
+        // stage trim: each card holds only its own layers' dense weights, so a DP read takes the other card's rows of
+        // its foreign layers from that card in place (WeightTable::set_dp_fallback, set for the read)
+        if (ok && stage_trim) dp_needs_map = true;
         if (ok && !held_in_ram && !peer_res) {
             std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off: with STRATA_DP_PEER_RES=0 a DP read streams the "
                                  "experts the other GPU caches, and with --mmap-experts / --resident-experts (or a file-backed arena that hands "
@@ -10899,8 +10902,8 @@ int main(int argc, char** argv) {
                 dp_on = false;
             } else if (dp_needs_map && !strata::prefill::Prefill::dp_link_mapped(link)) {
                 std::fprintf(stderr, "strata serve: DP prompt path off: the two cards do not map each other's memory, and "
-                                     "here (the experts not all in RAM) a DP read would take the other card's cached "
-                                     "experts from its slots in place\n");
+                                     "here (stage trim, or the experts not all in RAM) a DP read would take the other "
+                                     "card's weights or cached experts in place\n");
                 dp_on = false;
             } else {
                 sp.set_dp(&stages[0]->sp, &dp_ss[0], 0, split_at[0], link, 0);
